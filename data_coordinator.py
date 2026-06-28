@@ -25,7 +25,7 @@ USE_DB = os.environ.get("USE_DB") == "TRUE"
 
 # MongoDB Configuration (From your credentials)
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://munnadhali017_db_user:m0172326@cluster0.beetmpq.mongodb.net/?appName=Cluster0")
-MONGO_DB_NAME = "out_of_law_db"
+MONGO_DB_NAME = "venom_db"
 
 mongo_client = None
 mongo_db = None
