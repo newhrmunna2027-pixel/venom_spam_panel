@@ -19,6 +19,9 @@ import data_coordinator
 app = Flask(__name__, template_folder='templates')
 app.secret_key = "out_of_law_super_secret_key"
 
+# 🚀 Target Add Safe Thread Lock (Prevents Race-Condition Double Adds)
+target_add_lock = threading.Lock()
+
 # ==========================================
 # 🚀 INTEGRATED API CACHE & LIMITER (Replaces api.py)
 # ==========================================
@@ -1002,6 +1005,10 @@ def get_targets_panel():
         if 'addedByName' not in t or not t['addedByName']: t['addedByName'] = t.get('addedByUsername', 'System')
     return jsonify(targets)
 
+
+# ==========================================
+# 🟢 Target adding Endpoint (Double-add proof)
+# ==========================================
 @app.route('/api/target/add', methods=['POST'])
 def add_target():
     if not session.get('logged_in') or not session.get('user'): 
@@ -1011,6 +1018,8 @@ def add_target():
     uid = str(data.get('uid')).strip()
     reason = data.get('reason', '')
     duration_str = data.get('duration', '1 day')
+    
+    # 1. Quick pre-check (outside lock to avoid waiting for heavy API calls if already exists)
     active_data = load_json_safe(FILES['active'], [])
     limit_cfg = get_limit_config()
     current_global_limit = int(limit_cfg.get('global_limit', 40))
@@ -1028,6 +1037,7 @@ def add_target():
         if user_active_count >= add_limit:
             return jsonify({"success": False, "msg": "Your target limit is maxed. Please contact owner."})
     
+    # 2. Heavy API Fetch (Held outside of the lock to prevent hanging other user's requests)
     api_res = fetch_and_parse_ff_api(uid)
     if not api_res["success"]: 
         return jsonify({"success": False, "msg": api_res["msg"]})
@@ -1037,20 +1047,41 @@ def add_target():
     expire_at = 'permanent' if duration_str == 'permanent' else current_time + durations.get(duration_str, 86400000)
     target_name = api_res["data"]["basicInfo"].get("nickname", "Unknown")
 
-    active_data.append({
-        "id": f"t_{current_time}", "uid": uid, "name": target_name,
-        "reason": reason, "duration": duration_str, "addTime": current_time, "expireAt": expire_at,
-        "addedByUsername": user['username'], "addedByName": user.get('name', user['username']), 
-        "addedByRole": user['role'], "status": "Running"
-    })
-    save_json_locked(FILES['active'], active_data)
-    
-    profiles = load_json_safe(FILES['profile'], {})
-    profiles[uid] = api_res["data"]
-    save_json_locked(FILES['profile'], profiles)
+    # 3. Secure Critical Section (Write operations and final verification inside Thread Lock)
+    with target_add_lock:
+        latest_active_data = load_json_safe(FILES['active'], [])
+        
+        # Double check inside lock to block rapid concurrent requests
+        if any(isinstance(t, dict) and t.get('uid') == uid for t in latest_active_data): 
+            return jsonify({"success": False, "msg": "Target already exists (Duplicate request rejected)."})
+            
+        if len(latest_active_data) >= current_global_limit: 
+            return jsonify({"success": False, "msg": f"Global system limit ({current_global_limit}) reached!"})
+            
+        if not is_owner(user):
+            user_active_count = sum(1 for t in latest_active_data if isinstance(t, dict) and t.get('addedByUsername') == user['username'])
+            members = load_json_safe(FILES['members'], [])
+            db_user = next((m for m in members if m['username'] == user['username']), None)
+            add_limit = db_user.get('limit', 0) if db_user else user.get('limit', 0)
+            if user_active_count >= add_limit:
+                return jsonify({"success": False, "msg": "Your target limit is maxed. Please contact owner."})
+
+        latest_active_data.append({
+            "id": f"t_{current_time}", "uid": uid, "name": target_name,
+            "reason": reason, "duration": duration_str, "addTime": current_time, "expireAt": expire_at,
+            "addedByUsername": user['username'], "addedByName": user.get('name', user['username']), 
+            "addedByRole": user['role'], "status": "Running"
+        })
+        save_json_locked(FILES['active'], latest_active_data)
+        
+        profiles = load_json_safe(FILES['profile'], {})
+        profiles[uid] = api_res["data"]
+        save_json_locked(FILES['profile'], profiles)
+        
     add_target_log("ADD", uid, target_name, duration_str, user.get('name', user['username']))
     distribute_targets()
     return jsonify({"success": True, "msg": "Protocol active on target!"})
+
 
 @app.route('/api/target/delete', methods=['POST'])
 def delete_target():
@@ -1306,7 +1337,7 @@ def remove_whitelist():
 
 @app.route('/api/admin/clear_data', methods=['POST'])
 def clear_database_data():
-    if not session.get('logged_in') or not is_creator(session.get('user')):
+    if not session.get('logged_in') or not is_creator(session['user']):
         return jsonify({"success": False, "msg": "Unauthorized Access"}), 401
     data = request.json or {}
     target = str(data.get('target', '')).strip().lower()
