@@ -37,7 +37,7 @@ if MONGO_AVAILABLE:
         mongo_db = mongo_client[MONGO_DB_NAME]
         mongo_client.server_info()  # Force connection check to verify status
         MONGO_CONNECTED = True
-        print(f"[✓] MongoDB Connected Successfully! Database: {MONGO_DB_NAME} (7 Core Collections Synced)")
+        print(f"[✓] MongoDB Connected Successfully! Database: {MONGO_DB_NAME} (8 Core Collections Synced)")
     except Exception as e:
         print(f"[!] MongoDB Connection Failed: {e}. Falling back to SQLite/JSON exclusively.")
 
@@ -74,15 +74,35 @@ def init_db():
 
 
 # ==========================================
+# DEDUPLICATION HELPER FOR ACTIVE TARGETS
+# ==========================================
+def _deduplicate_targets(targets):
+    """Prevents overlapping duplicate entries for active targets"""
+    if not isinstance(targets, list):
+        return targets
+    seen = set()
+    deduped = []
+    for t in targets:
+        if isinstance(t, dict) and 'uid' in t:
+            uid_str = str(t['uid']).strip()
+            if uid_str not in seen:
+                seen.add(uid_str)
+                deduped.append(t)
+        else:
+            deduped.append(t)
+    return deduped
+
+
+# ==========================================
 # 1ST TIME RUN MONGODB ⇄ LOCAL MIGRATION
 # ==========================================
 def init_mongo():
-    """Synchronizes MongoDB with Local DB perfectly on 1st startup"""
+    """Synchronizes MongoDB with Local DB on 1st startup"""
     global MONGO_CONNECTED
     if not MONGO_CONNECTED: 
         return
     
-    print("[*] Initiating MongoDB ⇄ Local Database Sync for 7 Core Files...")
+    print("[*] Initiating MongoDB ⇄ Local Database Sync for 8 Core Files...")
 
     # 1. Synchronize Members (members.json)
     if mongo_db['members'].count_documents({}) == 0:
@@ -101,7 +121,8 @@ def init_mongo():
     if mongo_db['targets'].count_documents({}) == 0:
         local_targets = load_data('active.json', [], bypass_mongo=True)
         if local_targets:
-            mongo_db['targets'].insert_many([dict(x) for x in local_targets])
+            deduped_targets = _deduplicate_targets(local_targets)
+            mongo_db['targets'].insert_many([dict(x) for x in deduped_targets])
 
     # 3. Synchronize API Accounts, Bot Accounts, Stock Accounts
     files_to_sync = [('api.json', 'api'), ('bot.json', 'bot'), ('account/stock.json', 'stock')]
@@ -118,12 +139,27 @@ def init_mongo():
             vv_list = [{"uid": k, "password": v} for k, v in local_vv.items()]
             mongo_db['vv'].insert_many(vv_list)
 
-    # 5. 🚀 Synchronize Profile Cached Data (profile.json)
+    # 5. Synchronize Profile Cached Data (profile.json)
     if mongo_db['profiles'].count_documents({}) == 0:
         local_profiles = load_data('profile.json', {}, bypass_mongo=True)
-        if local_profiles:
+        if local_profiles and isinstance(local_profiles, dict):
             profile_list = [{"uid": k, "val": v} for k, v in local_profiles.items()]
             mongo_db['profiles'].insert_many(profile_list)
+
+    # 6. Synchronize Limit Config (limit.json)
+    if mongo_db['limit'].count_documents({}) == 0:
+        local_limit = load_data('limit.json', {}, bypass_mongo=True)
+        if local_limit and isinstance(local_limit, dict):
+            mongo_db['limit'].insert_one(dict(local_limit))
+        else:
+            default_limit = {
+                "global_limit": 40, 
+                "api_limit": 20, 
+                "default_line_3": "TIKTOK [FF00FF]→OUT OF LAW",
+                "allow_user_add_bot": True
+            }
+            mongo_db['limit'].insert_one(default_limit)
+            save_data('limit.json', default_limit, sync_mongo=False)
 
 
 # ==========================================
@@ -134,7 +170,7 @@ def load_data(filepath, default, bypass_mongo=False):
     normalized_path = filepath.replace('\\', '/').strip()
     filename = os.path.basename(normalized_path)
     
-    # 🚀 MONGODB INTERCEPTOR FOR ALL 7 CORE COLLECTIONS
+    # 🚀 MONGODB INTERCEPTOR FOR ALL 8 CORE COLLECTIONS
     if MONGO_CONNECTED and not bypass_mongo:
         try:
             if filename == 'members.json':
@@ -143,7 +179,7 @@ def load_data(filepath, default, bypass_mongo=False):
                 
             elif filename == 'active.json':
                 rows = list(mongo_db['targets'].find({}, {"_id": 0}))
-                return rows if rows else default
+                return _deduplicate_targets(rows) if rows else default
                 
             elif filename == 'vv.json':
                 rows = list(mongo_db['vv'].find({}, {"_id": 0}))
@@ -156,6 +192,10 @@ def load_data(filepath, default, bypass_mongo=False):
                 if rows:
                     return {r['uid']: r['val'] for r in rows}
                 return default
+
+            elif filename == 'limit.json':
+                row = mongo_db['limit'].find_one({}, {"_id": 0})
+                return row if row else default
                 
             elif filename in ['api.json', 'bot.json', 'stock.json']:
                 col_name = filename.split('.')[0]
@@ -174,7 +214,10 @@ def load_data(filepath, default, bypass_mongo=False):
             return default
         try:
             with open(normalized_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+                if filename == 'active.json':
+                    return _deduplicate_targets(data)
+                return data
         except Exception:
             return default
 
@@ -194,11 +237,12 @@ def load_data(filepath, default, bypass_mongo=False):
         elif filename == 'active.json':
             cursor = conn.execute("SELECT * FROM targets")
             rows = cursor.fetchall()
-            return [{
+            loaded = [{
                 "uid": r["uid"], "name": r["name"], "reason": r["reason"], "duration": r["duration"], 
                 "addTime": r["addTime"], "expireAt": r["expireAt"], "addedByUsername": r["addedByUsername"], 
                 "addedByName": r["addedByName"], "addedByRole": r["addedByRole"], "status": r["status"]
             } for r in rows]
+            return _deduplicate_targets(loaded)
 
         elif filename == 'profile.json':
             cursor = conn.execute("SELECT uid, val FROM profiles")
@@ -264,6 +308,10 @@ def save_data(filepath, data, sync_mongo=True):
     normalized_path = filepath.replace('\\', '/').strip()
     filename = os.path.basename(normalized_path)
     
+    # 🚀 Pre-deduplicate targets list if saving active targets
+    if filename == 'active.json':
+        data = _deduplicate_targets(data)
+
     # 🚀 MONGODB LIVE SYNC & PURGE CONTROL INTERCEPTOR
     if MONGO_CONNECTED and sync_mongo:
         try:
@@ -288,6 +336,11 @@ def save_data(filepath, data, sync_mongo=True):
                 if data:
                     profile_list = [{"uid": k, "val": v} for k, v in data.items()]
                     mongo_db['profiles'].insert_many(profile_list)
+
+            elif filename == 'limit.json':
+                mongo_db['limit'].delete_many({})
+                if data:
+                    mongo_db['limit'].insert_one(dict(data))
                     
             elif filename in ['api.json', 'bot.json', 'stock.json']:
                 col_name = filename.split('.')[0]
@@ -296,7 +349,7 @@ def save_data(filepath, data, sync_mongo=True):
                     mongo_db[col_name].insert_many([dict(x) for x in data])
                 
             # Keep physical backups for easy viewing
-            if filename in ['members.json', 'active.json', 'api.json', 'bot.json', 'stock.json', 'vv.json', 'profile.json']:
+            if filename in ['members.json', 'active.json', 'api.json', 'bot.json', 'stock.json', 'vv.json', 'profile.json', 'limit.json']:
                 try:
                     os.makedirs(os.path.dirname(normalized_path) if os.path.dirname(normalized_path) else '.', exist_ok=True)
                     tmp_path = normalized_path + ".tmp"
