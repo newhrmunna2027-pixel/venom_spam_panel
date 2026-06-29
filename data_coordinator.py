@@ -23,7 +23,10 @@ except ImportError:
 DB_FILE = "database.db"
 USE_DB = os.environ.get("USE_DB") == "TRUE"
 
-# MongoDB Configuration (From your credentials)
+# 🚀 মঙ্গোডিবি সিঙ্ক শুধুমাত্র ম্যানেজার বটের মাধ্যমে রান করলেই চালু হবে
+MONGO_SYNC_ENABLED = os.environ.get("MONGO_SYNC_ENABLED") == "TRUE"
+
+# MongoDB Configuration
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://munnadhali017_db_user:m0172326@cluster0.beetmpq.mongodb.net/?appName=Cluster0")
 MONGO_DB_NAME = "venom_db"
 
@@ -31,15 +34,20 @@ mongo_client = None
 mongo_db = None
 MONGO_CONNECTED = False
 
-if MONGO_AVAILABLE:
+# শুধুমাত্র MONGO_SYNC_ENABLED সত্য হলেই মঙ্গোডিবি কানেক্ট হবে
+if MONGO_AVAILABLE and MONGO_SYNC_ENABLED:
     try:
         mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         mongo_db = mongo_client[MONGO_DB_NAME]
         mongo_client.server_info()  # Force connection check to verify status
         MONGO_CONNECTED = True
-        print(f"[✓] MongoDB Connected Successfully! Database: {MONGO_DB_NAME} (8 Core Collections Synced)")
+        print(f"[✓] MongoDB Connected Successfully! Database: {MONGO_DB_NAME} (Active Background Sync Mode)")
     except Exception as e:
-        print(f"[!] MongoDB Connection Failed: {e}. Falling back to SQLite/JSON exclusively.")
+        print(f"[!] MongoDB Connection Failed: {e}. Running exclusively on Local Physical Storage.")
+else:
+    MONGO_CONNECTED = False
+    if MONGO_AVAILABLE:
+        print("[*] MongoDB Sync Disabled (Running Standalone Mode). Using Local Physical Files.")
 
 
 # ==========================================
@@ -94,83 +102,28 @@ def _deduplicate_targets(targets):
 
 
 # ==========================================
-# 1ST TIME RUN MONGODB ⇄ LOCAL MIGRATION
+# SAFE EXPIRE PARSER TO PREVENT EXPIRATION ERRORS
 # ==========================================
-def init_mongo():
-    """Synchronizes MongoDB with Local DB on 1st startup"""
-    global MONGO_CONNECTED
-    if not MONGO_CONNECTED: 
-        return
-    
-    print("[*] Initiating MongoDB ⇄ Local Database Sync for 8 Core Files...")
-
-    # 1. Synchronize Members (members.json)
-    if mongo_db['members'].count_documents({}) == 0:
-        local_members = load_data('members.json', [], bypass_mongo=True)
-        if local_members:
-            mongo_db['members'].insert_many([dict(x) for x in local_members])
-        else:
-            default_member = [{
-                "username": "creator", "password": "123", "name": "System Creator", 
-                "pic": "902000003", "role": "creator", "limit": 999999, "active_limit": 999999
-            }]
-            mongo_db['members'].insert_many([dict(x) for x in default_member])
-            save_data('members.json', default_member, sync_mongo=False)
-
-    # 2. Synchronize Active Targets (active.json)
-    if mongo_db['targets'].count_documents({}) == 0:
-        local_targets = load_data('active.json', [], bypass_mongo=True)
-        if local_targets:
-            deduped_targets = _deduplicate_targets(local_targets)
-            mongo_db['targets'].insert_many([dict(x) for x in deduped_targets])
-
-    # 3. Synchronize API Accounts, Bot Accounts, Stock Accounts
-    files_to_sync = [('api.json', 'api'), ('bot.json', 'bot'), ('account/stock.json', 'stock')]
-    for filename, collection_name in files_to_sync:
-        if mongo_db[collection_name].count_documents({}) == 0:
-            local_data = load_data(filename, [], bypass_mongo=True)
-            if local_data:
-                mongo_db[collection_name].insert_many([dict(x) for x in local_data])
-
-    # 4. Synchronize VV Accounts (Dict Format mapping)
-    if mongo_db['vv'].count_documents({}) == 0:
-        local_vv = load_data('vv.json', {}, bypass_mongo=True)
-        if local_vv:
-            vv_list = [{"uid": k, "password": v} for k, v in local_vv.items()]
-            mongo_db['vv'].insert_many(vv_list)
-
-    # 5. Synchronize Profile Cached Data (profile.json)
-    if mongo_db['profiles'].count_documents({}) == 0:
-        local_profiles = load_data('profile.json', {}, bypass_mongo=True)
-        if local_profiles and isinstance(local_profiles, dict):
-            profile_list = [{"uid": k, "val": v} for k, v in local_profiles.items()]
-            mongo_db['profiles'].insert_many(profile_list)
-
-    # 6. Synchronize Limit Config (limit.json)
-    if mongo_db['limit'].count_documents({}) == 0:
-        local_limit = load_data('limit.json', {}, bypass_mongo=True)
-        if local_limit and isinstance(local_limit, dict):
-            mongo_db['limit'].insert_one(dict(local_limit))
-        else:
-            default_limit = {
-                "global_limit": 40, 
-                "api_limit": 20, 
-                "default_line_3": "TIKTOK [FF00FF]→OUT OF LAW",
-                "allow_user_add_bot": True
-            }
-            mongo_db['limit'].insert_one(default_limit)
-            save_data('limit.json', default_limit, sync_mongo=False)
+def parse_expire_time(expire_at):
+    """Safely converts expire_at string/float to int. Falls back to permanent on error."""
+    if expire_at == 'permanent' or expire_at is None:
+        return 'permanent'
+    try:
+        # Handles decimal string representations like "1719680000000.0" safely
+        return int(float(expire_at))
+    except (ValueError, TypeError):
+        return 'permanent'
 
 
 # ==========================================
-# UNIVERSAL DATA LOADER
+# UNIVERSAL DATA LOADER (LOCAL-FIRST)
 # ==========================================
-def load_data(filepath, default, bypass_mongo=False):
-    """Loads data dynamically. Prioritizes MongoDB -> SQLite -> JSON"""
+def load_data(filepath, default, bypass_mongo=True):
+    """Loads data dynamically. Defaults to bypass_mongo=True to enforce Local Physical reading first."""
     normalized_path = filepath.replace('\\', '/').strip()
     filename = os.path.basename(normalized_path)
     
-    # 🚀 MONGODB INTERCEPTOR FOR ALL 8 CORE COLLECTIONS
+    # 🚀 MONGODB DIRECT ACCESS (USED EXCLUSIVELY FOR SYNCHRONIZATION RUNS)
     if MONGO_CONNECTED and not bypass_mongo:
         try:
             if filename == 'members.json':
@@ -202,10 +155,23 @@ def load_data(filepath, default, bypass_mongo=False):
                 rows = list(mongo_db[col_name].find({}, {"_id": 0}))
                 return rows if rows else default
                 
+            # 🚀 মঙ্গোডিবি নতুন ফাইলের সাপোর্ট
+            elif filename == 'ex.json':
+                rows = list(mongo_db['ex'].find({}, {"_id": 0}))
+                return rows if rows else default
+                
+            elif filename == 'whitelist.json':
+                row = mongo_db['whitelist'].find_one({}, {"_id": 0})
+                return row if row else default
+                
+            elif filename == 'data.json':
+                row = mongo_db['data'].find_one({}, {"_id": 0})
+                return row if row else default
+                
         except Exception as e:
-            print(f"[Mongo Read Error] {filename}: {e}")
+            print(f"[Mongo Direct Read Error] {filename}: {e}")
 
-    # --- LOCAL FALLBACK FOR OTHER FILES (SQLite or Local JSON) ---
+    # --- PRIMARY LOCAL READING FROM PHYSICAL DISK ---
     if not USE_DB:
         if not os.path.exists(normalized_path):
             os.makedirs(os.path.dirname(normalized_path) if os.path.dirname(normalized_path) else '.', exist_ok=True)
@@ -301,30 +267,104 @@ def load_data(filepath, default, bypass_mongo=False):
 
 
 # ==========================================
-# UNIVERSAL DATA SAVER (WITH PURGE SYNC)
+# UNIVERSAL DATA SAVER (LOCAL-FIRST SAVING & MONGO SYNC)
 # ==========================================
 def save_data(filepath, data, sync_mongo=True):
-    """Saves data dynamically. MONGODB Live Update & Purges are handled natively!"""
+    """Saves data physically to the local disk/SQLite first, then replicates to MongoDB."""
     normalized_path = filepath.replace('\\', '/').strip()
     filename = os.path.basename(normalized_path)
     
-    # 🚀 Pre-deduplicate targets list if saving active targets
     if filename == 'active.json':
         data = _deduplicate_targets(data)
 
-    # 🚀 MONGODB LIVE SYNC & PURGE CONTROL INTERCEPTOR
+    # --- STEP 1: PHYSICAL WRITE TO DISK OR SQLITE DATABASE ---
+    local_saved = False
+    if not USE_DB:
+        try:
+            os.makedirs(os.path.dirname(normalized_path) if os.path.dirname(normalized_path) else '.', exist_ok=True)
+            tmp_path = normalized_path + ".tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+            os.replace(tmp_path, normalized_path)
+            local_saved = True
+        except Exception as e:
+            print(f"[Physical Save Error] {filename}: {e}")
+    else:
+        conn = get_db_connection()
+        try:
+            if filename == 'members.json':
+                conn.execute("DELETE FROM members")
+                for u in data:
+                    conn.execute("INSERT INTO members (username, password, name, pic, role, limit_val, active_limit) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                 (u.get("username"), u.get("password"), u.get("name"), u.get("pic"), u.get("role"), u.get("limit"), u.get("active_limit")))
+
+            elif filename == 'active.json':
+                conn.execute("DELETE FROM targets")
+                for t in data:
+                    conn.execute("INSERT INTO targets (uid, name, reason, duration, addTime, expireAt, addedByUsername, addedByName, addedByRole, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                 (t.get("uid"), t.get("name"), t.get("reason"), t.get("duration"), t.get("addTime"), str(t.get("expireAt")), t.get("addedByUsername"), t.get("addedByName"), t.get("addedByRole"), t.get("status")))
+
+            elif filename == 'profile.json':
+                conn.execute("DELETE FROM profiles")
+                for uid, val in data.items():
+                    conn.execute("INSERT INTO profiles (uid, val) VALUES (?, ?)", (uid, json.dumps(val)))
+
+            elif filename == 'bots_live_status.json':
+                conn.execute("DELETE FROM bot_status")
+                for bot_id, val in data.items():
+                    conn.execute("INSERT INTO bot_status (bot_id, id_val, name, status, timestamp, game_uid) VALUES (?, ?, ?, ?, ?, ?)",
+                                 (bot_id, val.get("Id"), val.get("Name"), val.get("Status"), val.get("Timestamp"), val.get("Game uid")))
+
+            elif filename == 'target_logs.json':
+                conn.execute("DELETE FROM target_logs")
+                for log in data:
+                    conn.execute("INSERT INTO target_logs (action, uid, name, duration, by_val, time_val) VALUES (?, ?, ?, ?, ?, ?)",
+                         (log.get("action"), log.get("uid"), log.get("name"), log.get("duration"), log.get("by"), log.get("time")))
+
+            elif filename == 'bad_accounts.json':
+                conn.execute("DELETE FROM bad_accounts")
+                for bad in data:
+                    conn.execute("INSERT INTO bad_accounts (uid, source, reason, time_val) VALUES (?, ?, ?, ?)",
+                                 (bad.get("uid"), bad.get("source"), bad.get("reason"), bad.get("time")))
+
+            elif filename == 'history.json':
+                conn.execute("DELETE FROM history")
+                for h in data:
+                    conn.execute("INSERT INTO history (time_val, action, uid, name) VALUES (?, ?, ?, ?)",
+                                     (h.get("time"), h.get("action"), h.get("uid"), h.get("name")))
+
+            else:
+                conn.execute("INSERT OR REPLACE INTO configs (key, val) VALUES (?, ?)", (filename, json.dumps(data)))
+                
+            conn.commit()
+            local_saved = True
+        except Exception as e:
+            print(f"[SQLite Save Error] {filename}: {e}")
+        finally:
+            conn.close()
+
+    # Always keep updated backup JSON files for visual alignment
+    if filename in ['members.json', 'active.json', 'api.json', 'bot.json', 'stock.json', 'vv.json', 'profile.json', 'limit.json', 'ex.json', 'whitelist.json', 'data.json']:
+        try:
+            os.makedirs(os.path.dirname(normalized_path) if os.path.dirname(normalized_path) else '.', exist_ok=True)
+            tmp_path = normalized_path + ".tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+            os.replace(tmp_path, normalized_path)
+        except Exception:
+            pass
+
+    # --- STEP 2: REPLICATE DIRECTLY TO MONGODB IN BACKGROUND ---
     if MONGO_CONNECTED and sync_mongo:
         try:
             if filename == 'members.json':
                 mongo_db['members'].delete_many({}) 
-                if data: 
-                    mongo_db['members'].insert_many([dict(x) for x in data])
-                    
+                if data: mongo_db['members'].insert_many([dict(x) for x in data])
+                
             elif filename == 'active.json':
                 mongo_db['targets'].delete_many({}) 
-                if data: 
-                    mongo_db['targets'].insert_many([dict(x) for x in data])
-                    
+                if data: mongo_db['targets'].insert_many([dict(x) for x in data])
+                
             elif filename == 'vv.json':
                 mongo_db['vv'].delete_many({})
                 if data:
@@ -339,95 +379,114 @@ def save_data(filepath, data, sync_mongo=True):
 
             elif filename == 'limit.json':
                 mongo_db['limit'].delete_many({})
-                if data:
-                    mongo_db['limit'].insert_one(dict(data))
-                    
+                if data: mongo_db['limit'].insert_one(dict(data))
+                
             elif filename in ['api.json', 'bot.json', 'stock.json']:
                 col_name = filename.split('.')[0]
                 mongo_db[col_name].delete_many({})
-                if data:
-                    mongo_db[col_name].insert_many([dict(x) for x in data])
+                if data: mongo_db[col_name].insert_many([dict(x) for x in data])
                 
-            # Keep physical backups for easy viewing
-            if filename in ['members.json', 'active.json', 'api.json', 'bot.json', 'stock.json', 'vv.json', 'profile.json', 'limit.json']:
-                try:
-                    os.makedirs(os.path.dirname(normalized_path) if os.path.dirname(normalized_path) else '.', exist_ok=True)
-                    tmp_path = normalized_path + ".tmp"
-                    with open(tmp_path, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, indent=4)
-                    os.replace(tmp_path, normalized_path)
-                except Exception:
-                    pass
-                return True
+            # 🚀 মঙ্গোডিবি নতুন ফাইলের রিয়েল-টাইম সিঙ্ক
+            elif filename == 'ex.json':
+                mongo_db['ex'].delete_many({})
+                if data: mongo_db['ex'].insert_many([dict(x) for x in data])
+                
+            elif filename == 'whitelist.json':
+                mongo_db['whitelist'].delete_many({})
+                if data: mongo_db['whitelist'].insert_one(dict(data))
+                
+            elif filename == 'data.json':
+                mongo_db['data'].delete_many({})
+                if data: mongo_db['data'].insert_one(dict(data))
                 
         except Exception as e:
-            print(f"[Mongo Write Error] {filename}: {e}")
+            print(f"[Mongo Live Write Error] {filename}: {e}")
 
-    # --- LOCAL FALLBACK SAVER (SQLite or Local JSON) ---
-    if not USE_DB:
-        os.makedirs(os.path.dirname(normalized_path) if os.path.dirname(normalized_path) else '.', exist_ok=True)
-        tmp_path = normalized_path + ".tmp"
-        try:
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
-            os.replace(tmp_path, normalized_path)
-            return True
-        except Exception:
-            return False
+    return local_saved
 
-    conn = get_db_connection()
-    try:
-        if filename == 'members.json':
-            conn.execute("DELETE FROM members")
-            for u in data:
-                conn.execute("INSERT INTO members (username, password, name, pic, role, limit_val, active_limit) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                             (u.get("username"), u.get("password"), u.get("name"), u.get("pic"), u.get("role"), u.get("limit"), u.get("active_limit")))
 
-        elif filename == 'active.json':
-            conn.execute("DELETE FROM targets")
-            for t in data:
-                conn.execute("INSERT INTO targets (uid, name, reason, duration, addTime, expireAt, addedByUsername, addedByName, addedByRole, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                             (t.get("uid"), t.get("name"), t.get("reason"), t.get("duration"), t.get("addTime"), str(t.get("expireAt")), t.get("addedByUsername"), t.get("addedByName"), t.get("addedByRole"), t.get("status")))
+# ==========================================
+# BIDIRECTIONAL STARTUP SYNCHRONIZATION
+# ==========================================
+def init_mongo():
+    """Synchronizes MongoDB with Local DB on startup.
+    1. Loads live data from MongoDB to physical files on first run (MongoDB is Master).
+    2. If MongoDB is empty but Local has data, pushes local data to MongoDB to initialize.
+    """
+    global MONGO_CONNECTED
+    if not MONGO_CONNECTED: 
+        return
+    
+    print("[*] Initiating MongoDB ⇄ Local Physical File Sync...")
 
-        elif filename == 'profile.json':
-            conn.execute("DELETE FROM profiles")
-            for uid, val in data.items():
-                conn.execute("INSERT INTO profiles (uid, val) VALUES (?, ?)", (uid, json.dumps(val)))
+    # Generalized startup sync helper
+    def sync_startup(filename, default_val):
+        # Load from MongoDB directly
+        mongo_data = load_data(filename, default_val, bypass_mongo=False)
+        # Load from Local Physical File
+        local_data = load_data(filename, default_val, bypass_mongo=True)
 
-        elif filename == 'bots_live_status.json':
-            conn.execute("DELETE FROM bot_status")
-            for bot_id, val in data.items():
-                conn.execute("INSERT INTO bot_status (bot_id, id_val, name, status, timestamp, game_uid) VALUES (?, ?, ?, ?, ?, ?)",
-                             (bot_id, val.get("Id"), val.get("Name"), val.get("Status"), val.get("Timestamp"), val.get("Game uid")))
+        # Condition 1: If MongoDB has data (not empty/default), write to local physical file
+        if mongo_data and mongo_data != default_val:
+            save_data(filename, mongo_data, sync_mongo=False)
+            print(f"[✓] Loaded {filename} from MongoDB directly to Physical File.")
+        # Condition 2: If MongoDB is empty but Local has data, push to MongoDB
+        elif local_data and local_data != default_val:
+            save_data(filename, local_data, sync_mongo=True)
+            print(f"[✓] Pushed Local {filename} data to MongoDB (Cloud Initialized).")
 
-        elif filename == 'target_logs.json':
-            conn.execute("DELETE FROM target_logs")
-            for log in data:
-                conn.execute("INSERT INTO target_logs (action, uid, name, duration, by_val, time_val) VALUES (?, ?, ?, ?, ?, ?)",
-                     (log.get("action"), log.get("uid"), log.get("name"), log.get("duration"), log.get("by"), log.get("time")))
+    # members.json sync (separately to handle default creator account fallback)
+    members_mongo = load_data('members.json', [], bypass_mongo=False)
+    members_local = load_data('members.json', [], bypass_mongo=True)
+    if members_mongo:
+        save_data('members.json', members_mongo, sync_mongo=False)
+        print("[✓] Loaded members.json from MongoDB directly to Physical File.")
+    elif members_local:
+        save_data('members.json', members_local, sync_mongo=True)
+        print("[✓] Pushed Local members.json data to MongoDB (Cloud Initialized).")
+    else:
+        # Default Creator Account initialization
+        default_member = [{
+            "username": "creator", "password": "123", "name": "System Creator", 
+            "pic": "902000003", "role": "creator", "limit": 999999, "active_limit": 999999
+        }]
+        save_data('members.json', default_member, sync_mongo=True)
+        print("[✓] Initialized members.json with default Creator account on both local and cloud.")
 
-        elif filename == 'bad_accounts.json':
-            conn.execute("DELETE FROM bad_accounts")
-            for bad in data:
-                conn.execute("INSERT INTO bad_accounts (uid, source, reason, time_val) VALUES (?, ?, ?, ?)",
-                             (bad.get("uid"), bad.get("source"), bad.get("reason"), bad.get("time")))
+    # Core synchronization runs
+    sync_startup('active.json', [])
+    sync_startup('api.json', [])
+    sync_startup('bot.json', [])
+    sync_startup('account/stock.json', [])
+    sync_startup('vv.json', {})
+    sync_startup('profile.json', {})
+    
+    # 🚀 মঙ্গোডিবি নতুন ৩টি ফাইল ক্লাউড সিঙ্ক রান
+    sync_startup('ex.json', [])
+    sync_startup('whitelist.json', {"players": [], "guilds": []})
+    sync_startup('data.json', {})
 
-        elif filename == 'history.json':
-            conn.execute("DELETE FROM history")
-            for h in data:
-                conn.execute("INSERT INTO history (time_val, action, uid, name) VALUES (?, ?, ?, ?)",
-                                 (h.get("time"), h.get("action"), h.get("uid"), h.get("name")))
+    # limit.json configuration sync
+    limits_mongo = load_data('limit.json', {}, bypass_mongo=False)
+    limits_local = load_data('limit.json', {}, bypass_mongo=True)
+    if limits_mongo:
+        save_data('limit.json', limits_mongo, sync_mongo=False)
+        print("[✓] Loaded limit.json from MongoDB directly to Physical File.")
+    elif limits_local:
+        save_data('limit.json', limits_local, sync_mongo=True)
+        print("[✓] Pushed Local limit.json data to MongoDB (Cloud Initialized).")
+    else:
+        default_limit = {
+            "global_limit": 40, 
+            "api_limit": 20, 
+            "default_line_3": "TIKTOK [FF00FF]→OUT OF LAW",
+            "allow_user_add_bot": True
+        }
+        save_data('limit.json', default_limit, sync_mongo=True)
+        print("[✓] Initialized limit.json with default configuration on both local and cloud.")
 
-        else:
-            conn.execute("INSERT OR REPLACE INTO configs (key, val) VALUES (?, ?)", (filename, json.dumps(data)))
-            
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"[DB SAVE ERROR] {filename}: {e}")
-        return False
-    finally:
-        conn.close()
+    print("[✓] Startup Sync Engine Completed successfully!")
+
 
 # Initialize DBs on script load
 if USE_DB:
