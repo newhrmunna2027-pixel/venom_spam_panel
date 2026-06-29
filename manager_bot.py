@@ -10,8 +10,9 @@ import math
 import psutil
 from threading import Thread
 
-# central environmental db toggle
+# central environmental db toggle & Mongo activation
 os.environ["USE_DB"] = "TRUE"
+os.environ["MONGO_SYNC_ENABLED"] = "TRUE" # 🚀 ম্যানেজার পরিবেশের জন্য ক্লাউড সিঙ্ক সক্রিয় করা হল
 import data_coordinator
 
 # Configurations
@@ -39,6 +40,10 @@ API_FILE = 'api.json'
 TARGETS_TXT = 'targets.txt'
 INFO_JSON = 'info.json'
 UID_JSON = 'uid.json'
+
+# New Expiry File Configuration
+EX_FILE = 'ex.json'
+VV_TIMERS_FILE = 'vv_timers.json'
 
 def load_json(path, default):
     return data_coordinator.load_data(path, default)
@@ -171,12 +176,122 @@ def distribute_targets():
             
     save_json(CHECK_FILE, distribution)
 
+
+# ==========================================
+# 🚀 SMART SMART EX.JSON ACCOUNT PULLER
+# ==========================================
+def pull_account_from_pool(allow_ex=True):
+    """Pulls an account safely. API and Tracker check ex.json first, then fallback to stock.json."""
+    if allow_ex:
+        ex_bots = load_json(EX_FILE, [])
+        if ex_bots and len(ex_bots) > 0:
+            pulled = ex_bots.pop(0)
+            save_json(EX_FILE, ex_bots)
+            print(f"[*] Pulled account {pulled.get('uid')} from ex.json Pool.")
+            return pulled
+            
+    # Fallback directly to stock.json
+    stock = load_json(STOCK_FILE, [])
+    if stock and len(stock) > 0:
+        pulled = stock.pop(0)
+        save_json(STOCK_FILE, stock)
+        print(f"[*] Pulled account {pulled.get('uid')} from stock.json.")
+        return pulled
+        
+    return None
+
+
+# ==========================================
+# 🚀 4 HOURS TIMER ROTATION LOGIC FOR ATTACKERS
+# ==========================================
+def handle_vv_rotations():
+    """Tracks active attackers in vv.json and rotates them to ex.json after 4 hours of use."""
+    vv_bots = load_json(VV_FILE, {}) # Dict format
+    vv_timers = load_json(VV_TIMERS_FILE, {})
+    ex_bots = load_json(EX_FILE, [])
+    stock = load_json(STOCK_FILE, [])
+    
+    current_time = time.time()
+    changed = False
+    
+    # 1. Register new timers for untracked accounts
+    for uid in list(vv_bots.keys()):
+        if uid not in vv_timers:
+            vv_timers[uid] = current_time
+            changed = True
+            
+    # 2. Cleanup timers for deleted/failed accounts
+    for uid in list(vv_timers.keys()):
+        if uid not in vv_bots:
+            del vv_timers[uid]
+            changed = True
+            
+    # 3. Identify expired accounts (4 hours = 14400 seconds)
+    expired_uids = []
+    for uid, start_time in list(vv_timers.items()):
+        if current_time - start_time >= 14400:
+            expired_uids.append(uid)
+            
+    if expired_uids:
+        print(f"\n[🕒 ROTATION] Detected {len(expired_uids)} expired bot(s) in vv.json. Rotating now...")
+        for uid in expired_uids:
+            pwd = vv_bots.get(uid, "")
+            
+            # Send to ex.json (without duplication)
+            if not any(item.get('uid') == uid for item in ex_bots if isinstance(item, dict)):
+                ex_bots.append({"uid": uid, "password": pwd})
+                
+            # Remove from active lists
+            if uid in vv_bots:
+                del vv_bots[uid]
+            if uid in vv_timers:
+                del vv_timers[uid]
+                
+            # Get fresh account from stock to replace this bot inside vv.json & User configs
+            if len(stock) > 0:
+                new_acc = stock.pop(0)
+                new_uid = str(new_acc.get('uid')).strip()
+                new_pwd = str(new_acc.get('password')).strip()
+                
+                vv_bots[new_uid] = new_pwd
+                vv_timers[new_uid] = current_time
+                
+                # Replace the bot inside user profile databases as well to preserve the user's slot active limit
+                if os.path.exists(USERS_DIR):
+                    for filename in os.listdir(USERS_DIR):
+                        if filename.endswith('.json'):
+                            username = filename[:-5]
+                            user_data = get_user_bots(username)
+                            user_changed = False
+                            
+                            vv_list = user_data.get('vv', [])
+                            for idx, v in enumerate(vv_list):
+                                if str(v.get('uid')) == uid:
+                                    vv_list[idx] = {"uid": new_uid, "password": new_pwd}
+                                    user_changed = True
+                                    break
+                            if user_changed:
+                                save_user_bots(username, user_data)
+                print(f"[✓] rotated expired bot {uid} to ex.json. Replaced with stock bot: {new_uid}")
+            else:
+                print(f"[⚠️ WARNING] No stock accounts available to replace expired bot {uid}!")
+                
+        save_json(VV_FILE, vv_bots)
+        save_json(VV_TIMERS_FILE, vv_timers)
+        save_json(EX_FILE, ex_bots)
+        save_json(STOCK_FILE, stock)
+        
+        compile_master_bots()
+        distribute_targets()
+    elif changed:
+        save_json(VV_TIMERS_FILE, vv_timers)
+
+
 def auto_distribute_bots():
     limit_cfg = load_json(LIMIT_FILE, {"global_limit": 40, "api_limit": 2})
     global_limit = int(limit_cfg.get('global_limit', 40))
     api_limit = int(limit_cfg.get('api_limit', 2))
     
-    stock = load_json(STOCK_FILE, [])
     api_bots = load_json(API_FILE, []) 
     bot_bots = load_json(BOT_FILE, [])
     vv_bots = load_json(VV_FILE, {})
@@ -187,19 +302,13 @@ def auto_distribute_bots():
         bot_bots = []
     if not isinstance(vv_bots, dict):
         vv_bots = {}
-    if not isinstance(stock, list):
-        stock = []
     
     changed = False
-    
-    def pull_account():
-        if len(stock) > 0:
-            return stock.pop(0)
-        return None
 
-    if len(api_bots) < api_limit and len(stock) > 0:
-        while len(api_bots) < api_limit and len(stock) > 0:
-            new_acc = pull_account()
+    # 🚀 API Bots Scale: Check ex.json first, then fallback to stock
+    if len(api_bots) < api_limit:
+        while len(api_bots) < api_limit:
+            new_acc = pull_account_from_pool(allow_ex=True)
             if new_acc:
                 api_bots.append({
                     "uid": str(new_acc['uid']).strip(),
@@ -278,8 +387,9 @@ def auto_distribute_bots():
     if len(vv_bots) >= max_vv_slots:
         add_attacker = False
 
-    if add_attacker and len(stock) > 0:
-        new_acc = pull_account()
+    # 🚀 Attackers Scale: Always pulls directly from stock.json (allow_ex=False)
+    if add_attacker:
+        new_acc = pull_account_from_pool(allow_ex=False)
         if new_acc:
             vv_bots[str(new_acc['uid'])] = new_acc['password']
             changed = True
@@ -315,15 +425,15 @@ def auto_distribute_bots():
     if len(bot_bots) >= max_tracker_slots:
         add_tracker = False
 
-    if add_tracker and len(stock) > 0:
-        new_acc = pull_account()
+    # 🚀 Trackers Scale: Check ex.json first, then fallback to stock
+    if add_tracker:
+        new_acc = pull_account_from_pool(allow_ex=True)
         if new_acc:
             bot_bots.append(new_acc)
             changed = True
             print(f"[+] Scaled Trackers! Added Bot: {new_acc['uid']} (Max Slot Capacity: {max_tracker_slots})")
 
     if changed:
-        save_json(STOCK_FILE, stock)
         save_json(API_FILE, api_bots)
         save_json(BOT_FILE, bot_bots)
         save_json(VV_FILE, vv_bots)
@@ -337,7 +447,6 @@ def process_bad_accounts():
         
     save_json(BAD_ACCS_FILE, [])
     
-    # 🟢 DYNAMIC ORPHAN SYSTEM CLEANER
     global_bot_bots = load_json(BOT_FILE, [])
     global_vv_bots = load_json(VV_FILE, {})
     global_changed = False
@@ -418,7 +527,6 @@ def process_bad_accounts():
                 save_user_bots(username, user_data)
                 changed = True
                 
-    # safe purge from bots_live_status.json (Console Status) immediately
     live_status = load_json(LIVE_FILE, {})
     live_changed = False
     for key, bot_data in list(live_status.items()):
@@ -458,6 +566,7 @@ def system_daemon():
     while True:
         try:
             process_bad_accounts()
+            handle_vv_rotations() # 🚀 প্রতি সেকেন্ডে অ্যাটাকার রোটেশন ও ৪ ঘণ্টার টাইমার লুপ চেক করবে
             auto_distribute_bots()
         except Exception:
             pass
@@ -474,6 +583,7 @@ def start_process(script_name):
     print(f"[+] Starting {script_name}...")
     my_env = os.environ.copy()
     my_env["USE_DB"] = "TRUE" # enforce sqlite for spawned scripts
+    my_env["MONGO_SYNC_ENABLED"] = "TRUE" # 🚀 চাইল্ড প্রসেসগুলোর জন্যও ক্লাউড সিঙ্ক সক্রিয় রাখা হল
     return subprocess.Popen([sys.executable, script_name], env=my_env)
 
 def stop_process(proc, script_name):
@@ -495,15 +605,12 @@ def main():
     kill_orphaned_instances()
     time.sleep(1)
 
-    # Clean existing status file on fresh startup
     save_json(LIVE_FILE, {})
 
-    # ডেমো থ্রেড স্টার্ট করা
     watcher_thread = Thread(target=system_daemon, daemon=True)
     watcher_thread.start()
     print("[✓] Dynamic System Daemon Watcher Active (1s Loop).")
 
-    # ক্রমানুসারে সবগুলো স্ক্রিপ্ট সঠিকভাবে চালু করা হচ্ছে (API.py Removed)
     p_app = start_process('app.py')
     time.sleep(3)
     p_info = start_process('info.py')
