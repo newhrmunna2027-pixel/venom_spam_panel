@@ -426,17 +426,17 @@ def check_expired_targets():
     for t in active_data:
         if not isinstance(t, dict):
             continue
-        expire_at = t.get('expireAt')
         
+        expire_at = t.get('expireAt')
         is_expired = False
-        if expire_at == 'permanent':
+        
+        # 🚀 টাইপ-সেফ এক্সপায়ার হ্যান্ডলিং (Decimal string-friendly)
+        parsed_expire = data_coordinator.parse_expire_time(expire_at)
+        
+        if parsed_expire == 'permanent':
             is_expired = False
-        elif isinstance(expire_at, (int, float)):
-            is_expired = int(expire_at) <= current_time
-        elif isinstance(expire_at, str) and expire_at.isdigit():
-            is_expired = int(expire_at) <= current_time
         else:
-            is_expired = True
+            is_expired = parsed_expire <= current_time
 
         if not is_expired:
             new_active.append(t)
@@ -452,6 +452,7 @@ def check_expired_targets():
         save_json_locked(FILES['active'], new_active)
         save_json_locked(FILES['profile'], profiles)
         distribute_targets()
+        
 
 # 🚀 3. NATIVE INTERNAL FETCHER (Bypasses HTTP overhead entirely)
 def fetch_and_parse_ff_api(uid):
